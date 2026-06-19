@@ -360,16 +360,22 @@ static bool trap_initial_soh (char c)
     if(c == ASCII_SOH || c == ASCII_STX) {
 
         rx_buffer.head = rx_buffer.tail = 0;
-        rt_handler = hal.stream.set_enqueue_rt_handler(put_char);   // Buffer stream input for YModem protocol
-
-        on_execute_realtime = grbl.on_execute_realtime;             // Add YModem protocol loop
-        grbl.on_execute_realtime = protocol_loop;                   // to grblHAL foreground process
 
         memset(&ymodem, 0, sizeof(ymodem));                         // Init YModem variables
         ymodem.process = await_soh;
         ymodem.next_timeout = hal.get_elapsed_ticks() + 1000;
 
-        put_char(c);
+        put_char(c);                                                // Buffer the SOH/STX just consumed
+
+        // Publish the input handler and protocol loop ONLY after the state above is fully initialised.
+        // The simulator feeds stream input on a different thread than grbl's realtime loop, so the moment
+        // grbl.on_execute_realtime = protocol_loop becomes visible the loop may run immediately on the other
+        // thread. If next_timeout/process were not set yet it saw next_timeout == 0 and fired a spurious
+        // timeout NAK before block 0 - the sender then retransmits block 0 out of sequence and the transfer
+        // stalls. Initialise-before-publish closes that window (and guards process == NULL being called).
+        rt_handler = hal.stream.set_enqueue_rt_handler(put_char);   // Buffer stream input for YModem protocol
+        on_execute_realtime = grbl.on_execute_realtime;             // Add YModem protocol loop
+        grbl.on_execute_realtime = protocol_loop;                   // to grblHAL foreground process
 
         return true;                                                // Return true to drop character
     }
