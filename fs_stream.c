@@ -497,6 +497,12 @@ FLASHMEM static bool stream_suspend (bool suspend)
 
 FLASHMEM static void terminate_job (void *data)
 {
+    // WEDGE-DBG (2026-07, temporary): this sets EXEC_STOP - the only known way to do so besides the
+    // CMD_STOP realtime byte. If this fires without a matching CMD_STOP byte counted (protocol.c),
+    // it's the mechanism behind the mystery reboot. See ioSender-side memory
+    // iosender-streamer-thread.md.
+    hal.stream.write_all("[MSG:WEDGE-DBG terminate_job called - connection change with a file job active]" ASCII_EOL);
+
     if(state_get() == STATE_CYCLE) {
         // Halt motion so that executing stop does not result in loss of position
         system_set_exec_state_flag(EXEC_MOTION_CANCEL);
@@ -530,6 +536,16 @@ static bool check_input_stream (uint8_t c)
 
 FLASHMEM static void stream_changed (stream_type_t type)
 {
+    // WEDGE-DBG (2026-07, temporary): every call to this function, regardless of outcome - shows
+    // whether a macro file handle is (unexpectedly) still open at the time of a stream/connection
+    // change event. See ioSender-side memory iosender-streamer-thread.md.
+    {
+        char dbgbuf[80];
+        snprintf(dbgbuf, sizeof(dbgbuf), "[MSG:WEDGE-DBG stream_changed: type=%u file.handle=%s]" ASCII_EOL,
+            (unsigned)type, file.handle != NULL ? "OPEN" : "NULL");
+        hal.stream.write_all(dbgbuf);
+    }
+
     if(type != StreamType_File && file.handle != NULL) {
 
         // Reconnect from WebUI?
