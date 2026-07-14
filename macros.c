@@ -79,8 +79,17 @@ FLASHMEM static bool end_macro (bool failed)
 
             if(macro[stack_idx].pos_return)
                 stream_reposition(macro[stack_idx].file, macro[stack_idx].pos_return, macro[stack_idx].line_number);
-            else
+            else {
+                // WEDGE-DBG (2026-07, temporary): this is the actual "remove" call for the
+                // stream_file.c redirect (hal.stream.read = stream_read_file) - trace it, since
+                // fs_stream.c's onReset()/stream_end_job() (a SEPARATE redirect mechanism) never
+                // fired at all in the last repro, meaning THIS is the mechanism actually in play for
+                // named/numbered macro calls. See ioSender-side memory iosender-streamer-thread.md.
+                char dbgbuf[80];
+                snprintf(dbgbuf, sizeof(dbgbuf), "[MSG:WEDGE-DBG macros: stream_redirect_close, stack_idx=%d failed=%d]" ASCII_EOL, (int)stack_idx, (int)failed);
+                hal.stream.write_all(dbgbuf);
                 stream_redirect_close(macro[stack_idx].file);
+            }
 #if NGC_EXPRESSIONS_ENABLE
             ngc_flowctrl_unwind_stack(macro[stack_idx].file);
 #endif
@@ -104,6 +113,16 @@ FLASHMEM static bool end_macro (bool failed)
 // Called on a soft reset so that normal operation can be restored.
 FLASHMEM static void plugin_reset (void)
 {
+    // WEDGE-DBG (2026-07, temporary): unconditional entry trace - confirms plugin_reset() (this
+    // plugin's own hal.driver_reset hook) actually fires for the Reset, and shows stack_idx (how many
+    // nested macro calls were active) before cleanup. See ioSender-side memory
+    // iosender-streamer-thread.md.
+    {
+        char dbgbuf[80];
+        snprintf(dbgbuf, sizeof(dbgbuf), "[MSG:WEDGE-DBG macros: plugin_reset() entered, stack_idx=%d]" ASCII_EOL, (int)stack_idx);
+        hal.stream.write_all(dbgbuf);
+    }
+
     while(stack_idx >= 0)
         end_macro(true);
 
@@ -178,6 +197,16 @@ FLASHMEM static status_code_t macro_start (char *filename, macro_id_t macro_id, 
 
         if((file = stream_redirect_read(filename, onG65MacroError, onG65MacroEOF)) == NULL)
             return Status_FileOpenFailed;
+
+        // WEDGE-DBG (2026-07, temporary): the "install" call - stream_redirect_read() (stream_file.c)
+        // just set hal.stream.read = stream_read_file. Trace it so we know a macro file redirect is
+        // active, which file, and at what stack depth. See ioSender-side memory
+        // iosender-streamer-thread.md.
+        {
+            char dbgbuf[100];
+            snprintf(dbgbuf, sizeof(dbgbuf), "[MSG:WEDGE-DBG macros: stream_redirect_read '%s' macro_id=%d stack_idx-next=%d]" ASCII_EOL, filename, (int)macro_id, (int)(stack_idx + 1));
+            hal.stream.write_all(dbgbuf);
+        }
 
         stack_push(macro_id, 0, repeats, hal.stream.file, 0, 0, pstack);
     }
