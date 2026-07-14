@@ -108,6 +108,18 @@ static status_message_ptr status_message = NULL;
 static on_vfs_mount_ptr on_vfs_mount;
 static on_vfs_unmount_ptr on_vfs_unmount;
 
+// WEDGE-DBG (2026-07, temporary): trace every install/remove of the hal.stream.read file-redirect -
+// the reset-wedge investigation's leading theory (see onReset() below, and ioSender-side memory
+// iosender-streamer-thread.md) is that a Reset landing while this redirect is active, but NOT going
+// through onReset()'s cleanup, leaves hal.stream.read permanently stuck reading from the (closed/
+// exhausted) file - explaining a permanent phantom-data loop with no ring-buffer/network involvement.
+static void wedge_dbg_stream_read_note (const char *where)
+{
+    char dbgbuf[160];
+    snprintf(dbgbuf, sizeof(dbgbuf), "[MSG:WEDGE-DBG stream.read: %s]" ASCII_EOL, where);
+    hal.stream.write_all(dbgbuf);
+}
+
 static void onCycleStart (void);
 static void stream_end_job (bool flush);
 static void onRealtimeReport (stream_write_ptr stream_write, report_tracking_flags_t report);
@@ -302,6 +314,11 @@ FLASHMEM static status_code_t list_files (bool filtered)
 
 FLASHMEM static void stream_end_job (bool flush)
 {
+    // WEDGE-DBG (2026-07, temporary): this is the ONLY place that restores hal.stream from
+    // active_stream (the true original stream, e.g. telnet) - trace every call, since the whole
+    // theory hinges on whether this actually runs around a Reset that interrupts a macro file.
+    wedge_dbg_stream_read_note("stream_end_job() called - about to restore hal.stream from active_stream");
+
     file_close();
 
     if(grbl.on_program_completed == onProgramCompleted)
@@ -388,8 +405,10 @@ ISR_CODE static bool ISR_FUNC(drop_input_stream)(uint8_t c)
 
 ISR_CODE static void ISR_FUNC(onCycleStart)(void)
 {
-    if(hal.stream.read == await_cycle_start)
+    if(hal.stream.read == await_cycle_start) {
         hal.stream.read = read_redirected;
+        wedge_dbg_stream_read_note("onCycleStart -> read_redirected (resuming file after cycle-start wait)");
+    }
 
     if(grbl.on_cycle_start == onCycleStart) {
         grbl.on_cycle_start = on_cycle_start;
@@ -454,6 +473,7 @@ FLASHMEM static void onProgramCompleted (program_flow_t program_flow, bool check
             file_rewind();
             if(program_flow != ProgramFlow_Return) {
                 hal.stream.read = await_cycle_start;
+                wedge_dbg_stream_read_note("onProgramCompleted -> await_cycle_start (waiting for restart)");
                 if(grbl.on_cycle_start != onCycleStart) {
                     on_cycle_start = grbl.on_cycle_start;
                     grbl.on_cycle_start = onCycleStart;
@@ -472,6 +492,7 @@ ISR_CODE static bool ISR_FUNC(await_toolchange_ack)(uint8_t c)
 {
     if(c == CMD_TOOL_ACK) {
         hal.stream.read = active_stream.read;                           // Restore normal stream input for tool change (jog etc)
+        wedge_dbg_stream_read_note("await_toolchange_ack -> active_stream.read (tool-change ack received)");
         active_stream.set_enqueue_rt_handler(enqueue_realtime_command); // ...
         if(grbl.on_toolchange_ack)
             grbl.on_toolchange_ack();
@@ -485,10 +506,12 @@ FLASHMEM static bool stream_suspend (bool suspend)
 {
     if(suspend) {
         hal.stream.read = stream_get_null;                              // Set read function to return empty,
+        wedge_dbg_stream_read_note("stream_suspend(true) -> stream_get_null (tool-change wait begins)");
         active_stream.reset_read_buffer();                              // flush input buffer,
         active_stream.set_enqueue_rt_handler(await_toolchange_ack);     // and set handler to wait for tool change acknowledge.
     } else {
         hal.stream.read = read_redirected;                              // Resume reading from file
+        wedge_dbg_stream_read_note("stream_suspend(false) -> read_redirected (tool-change wait ended)");
         hal.stream.set_enqueue_rt_handler(drop_input_stream);           // ..
     }
 
@@ -527,6 +550,7 @@ static bool check_input_stream (uint8_t c)
     if(!(ok = enqueue_realtime_command(c))) {
         if(hal.stream.read != stream_get_null) {
             hal.stream.read = stream_get_null;
+            wedge_dbg_stream_read_note("check_input_stream -> stream_get_null (stream takeover, terminate_job queued)");
             task_add_immediate(terminate_job, NULL);
         }
     }
@@ -553,6 +577,7 @@ FLASHMEM static void stream_changed (stream_type_t type)
             active_stream.set_enqueue_rt_handler(enqueue_realtime_command); // Restore previous real time handler,
             memcpy(&active_stream, &hal.stream, sizeof(io_stream_t));       // save current stream pointers
             hal.stream.read = read_redirected;                              // then redirect to read from file instead
+            wedge_dbg_stream_read_note("stream_changed (webui reconnect) -> read_redirected");
             stream_set_type(StreamType_File, file.handle);                  // ...
 
             if(hal.stream.suspend_read)                                     // If active stream support tool change suspend
@@ -595,6 +620,7 @@ FLASHMEM status_code_t stream_file (sys_state_t state, char *fname)
 
                 memcpy(&active_stream, &hal.stream, sizeof(io_stream_t));   // Save current stream pointers
                 hal.stream.read = stream_read;                              // then redirect to read from file
+                wedge_dbg_stream_read_note("stream_file -> stream_read (macro/job file engaged)");
                 stream_set_type(StreamType_File, file.handle);              // ...
                 if(hal.stream.suspend_read)                                 // If active stream support tool change suspend
                     hal.stream.suspend_read = stream_suspend;               // then we do as well
@@ -621,6 +647,7 @@ FLASHMEM status_code_t stream_file (sys_state_t state, char *fname)
                     grbl.on_stream_changed(hal.stream.type);
 
                 read_redirected = hal.stream.read;
+                wedge_dbg_stream_read_note("stream_file: read_redirected captured (== stream_read, NOT the original underlying stream)");
 
                 if(grbl.on_stream_changed != stream_changed) {
                     on_stream_changed = grbl.on_stream_changed;
@@ -811,6 +838,17 @@ FLASHMEM static status_code_t cmd_unlink (sys_state_t state, char *args)
 
 FLASHMEM static void onReset (void)
 {
+    // WEDGE-DBG (2026-07, temporary): unconditional entry trace - the whole leading theory for the
+    // reset-wedge investigation is that this handler either never runs, or its guard below evaluates
+    // false, on the specific Reset that leaves hal.stream.read stuck on the file reader. This settles
+    // it either way: confirms onReset() fires at all, and shows the guard's inputs at that moment.
+    {
+        char dbgbuf[100];
+        snprintf(dbgbuf, sizeof(dbgbuf), "[MSG:WEDGE-DBG onReset() entered: file.handle=%s active_stream.type=%u]" ASCII_EOL,
+            file.handle != NULL ? "OPEN" : "NULL", (unsigned)active_stream.type);
+        hal.stream.write_all(dbgbuf);
+    }
+
     // Tighten the guard: clean up if EITHER a file is open OR we hijacked the
     // stream. The previous guard required hal.stream.type == StreamType_File,
     // which fails transiently during tool-change suspend_read, on_stream_changed
