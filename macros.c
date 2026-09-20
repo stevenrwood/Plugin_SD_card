@@ -294,10 +294,33 @@ FLASHMEM static atc_status_t atc_get_state (void)
             : (settings.macro_atc_flags.error_on_no_macro ? ATC_Offline : ATC_None);
 }
 
+// Install the ATC state reporter if the operator has asked for a missing tc.macro to be an ERROR
+// rather than a shrug. That flag is what turns "no ATC here" into "ATC wanted but not provisioned",
+// i.e. ATC_Offline -> "ATC=0" in $I, which is the signal a sender needs in order to offer to upload
+// the macros. Without it the controller reports a bare "TC" and the sender has no way to tell an
+// ATC machine missing its macros from a machine that never had an ATC.
+//
+// Run BOTH at startup and on a $675 write. Startup alone was a trap: after an NVS wipe the
+// controller boots with the flag clear, so restoring $675 appeared to do nothing - $I kept saying
+// "TC" and the sender kept greying out the very upload that would have fixed it - until someone
+// happened to reset. The setting is now honoured when it is written.
 FLASHMEM static void atc_check (void *data)
 {
     if(settings.macro_atc_flags.error_on_no_macro)
         hal.tool.atc_get_state = atc_get_state;
+}
+
+// NOTE: deliberately no "uninstall" when the flag is CLEARED. atc_get_state() reads the flag live,
+// so once the flag is off it reports exactly what the core default (grbllib.c) would - ATC_Online
+// while tc.macro is mounted, ATC_None otherwise - because hal.driver_cap.atc is set by
+// atc_macros_attach() in the same breath as hal.tool.change. Leaving it installed is equivalent and
+// avoids restoring a pointer that atc_macros_attach() may legitimately own.
+FLASHMEM static void macro_settings_changed (settings_t *settings, settings_changed_flags_t changed)
+{
+    UNUSED(settings);
+    UNUSED(changed);
+
+    atc_check(NULL);
 }
 
 FLASHMEM static void atc_macros_attach (const char *path, const vfs_t *fs, vfs_st_mode_t mode)
@@ -406,7 +429,8 @@ FLASHMEM void fs_macros_init (void)
         .descriptions = macro_settings_descr,
         .n_descriptions = sizeof(macro_settings_descr) / sizeof(setting_descr_t),
         .restore = macro_settings_restore,
-        .save = settings_write_global
+        .save = settings_write_global,
+        .on_changed = macro_settings_changed
     };
 
     on_vfs_mount = vfs.on_mount;
